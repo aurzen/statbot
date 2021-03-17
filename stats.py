@@ -4,68 +4,107 @@ import asyncio as aio
 import aurcore
 import asyncpg
 import asyncpg.pool
-import aurflux
+
+from aurflux.command import Command, Response
+from aurflux.context import GuildMessageCtx
+import aurflux.auth
+import aurflux.cog
 import typing as ty
 import TOKENS
 import tqdm
 import discord
+import datetime
 
 if ty.TYPE_CHECKING:
-    from aurflux.command import *
+   from aurflux.command import Command
 
 import decompose
 import aurflux
+import discord.ext.commands
+import pickle
 
 
-class MessageScraper(aurflux.AurfluxCog):
-    async def startup(self):
-        # noinspection PyAttributeOutsideInit
-        self.pool: asyncpg.pool.Pool = await asyncpg.create_pool(TOKENS.PSQL_STRING, ssl=True)
-        # self.conn: asyncpg.Connection = await asyncpg.connect(TOKENS.PSQL_STRING, ssl=True)
-        # await self.conn.execute('CREATE UNLOGGED TABLE IF NOT EXISTS mentions('
-        #                         'message_id BIGINT PRIMARY KEY NOT NULL,'
-        #                         'author_id BIGINT NOT NULL,'
-        #                         'target_id BIGINT NOT NULL,'
-        #                         'type TEXT NOT NULL)')
-        # await self.conn.execute('CREATE UNLOGGED TABLE IF NOT EXISTS messages('
-        #                         'message_id BIGINT PRIMARY KEY UNIQUE NOT NULL,'
-        #                         'author_id BIGINT NOT NULL,'
-        #                         'guild_id BIGINT,'
-        #                         'created_at TIMESTAMPTZ NOT NULL,'
-        #                         'channel_id BIGINT NOT NULL,'
-        #                         'content TEXT,'
-        #                         'clean_content TEXT,'
-        #                         'has_mentions BOOLEAN NOT NULL DEFAULT FALSE,'
-        #                         'embeds TEXT)')
+class MessageScraper(aurflux.cog.FluxCog):
 
-    async def process_message(self, message: discord.Message):
-        message_query, message_args = decompose.build_insert(decompose.message(message), "messages")
-        async with self.pool.acquire() as c:
-            await c.execute(message_query, *message_args)
+   async def startup(self):
+      print(f"Starting up {self}")
+      self.pool: asyncpg.pool.Pool = await asyncpg.create_pool(TOKENS.PSQL_STRING, ssl=True)
 
-        mention_query, mention_args = decompose.build_insert(decompose.mentions(message), "mentions")
-        if mention_query:
-            async with self.pool.acquire() as c:
-                await c.execute(mention_query, *mention_args)
+      def _():
+         pass
 
-    async def oldest_in_channel(self, channel_id: int):
-        async with self.pool.acquire() as c:
-            oldest = await c.fetchrow("SELECT created_at FROM messages WHERE channel_id = $0 ORDER BY created_at LIMIT 1", channel_id)
-        return oldest["created_at"]
+   async def process_message(self, message: discord.Message):
+      message_query, message_args = decompose.build_insert(decompose.message(message), "messages")
+      async with self.pool.acquire() as c:
+         await c.execute(message_query, *message_args)
 
-    def route(self):
-        @self.aurflux.router.endpoint(":message", decompose=True)
-        async def message_handler(message: discord.Message):
+      mention_query, mention_args = decompose.build_insert(decompose.mentions(message), "mentions")
+      if mention_query:
+         async with self.pool.acquire() as c:
+            await c.execute(mention_query, *mention_args)
+
+   async def oldest_in_channel(self, channel_id: int):
+      async with self.pool.acquire() as c:
+         oldest = await c.fetchrow("SELECT MIN(created_at) FROM messages WHERE channel_id = $1 AND emoji_ids != '{}'", channel_id)
+         print(oldest)
+
+      return oldest["min"]
+
+   async def scrape_channel(self, channel: discord.TextChannel):
+      oldest = None
+      try:
+         with open(f"{channel.id}.latest", "rb") as f:
+            oldest = pickle.load(f)
+      except FileNotFoundError:
+         pass
+
+      pbar = tqdm.tqdm()
+      try:
+         i: int = 0
+
+         async for message in channel.history(limit=None, before=oldest):
             await self.process_message(message)
+            pbar.update()
+            if i % 1000 == 0:
+               pbar.set_description(f"{channel.name}: {message.created_at.isoformat()}")
+               i = 0
+            if i % 10000 == 0:
+               with open(f"{channel.id}.latest", "wb") as f:
+                  pickle.dump(message.created_at, f)
 
-        @self.aurflux.commandeer(name="scrape", parsed=False, private=True)
-        async def scrape(ctx: MessageContext, args):
-            pbar = tqdm.tqdm()
-            channel: discord.TextChannel
-            for channel in self.aurflux.get_guild(int(args)).text_channels:
-                try:
-                    async for message in channel.history(limit=None, before=await self.oldest_in_channel(channel.id)):
-                        await self.process_message(message)
-                        pbar.update()
-                except discord.errors.Forbidden:
-                    pass
+            i += 1
+      except discord.errors.Forbidden:
+         pass
+
+   def load(self):
+      @self.flux.router.endpoint(":message", decompose=True)
+      async def message_handler(message: discord.Message):
+         await self.process_message(message)
+
+      @self._commandeer(name="scrape")
+      async def scrape(ctx: GuildMessageCtx, args):
+         if channel := self.flux.get_channel(int(args)):
+            await self.scrape_channel(channel)
+         else:
+            for channel in self.flux.get_guild(int(args)).text_channels:
+               await self.scrape_channel(channel)
+         return Response("Done!")
+
+      @self._commandeer(name="names")
+      async def names(ctx: GuildMessageCtx, _):
+         async with self.pool.acquire() as c:
+            async with self.pool.acquire() as c2:
+               async with c.transaction():
+                  pbar = tqdm.tqdm()
+                  async for record in c.cursor("SELECT DISTINCT author_id from messages"):
+                     pbar.update(1)
+                     user_id = record["author_id"]
+                     user = await self.flux.fetch_user(user_id)
+                     if user:
+                        user_query, user_args = decompose.build_insert(decompose.user(user), "users")
+                        await c2.execute(user_query, *user_args)
+
+         return Response()
+
+   def override_auths(self) -> ty.List[aurflux.auth.Record]:
+      return [aurflux.auth.Record.deny_all()]
