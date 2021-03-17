@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-import asyncio as aio
-import aurcore
+import typing as ty
+
 import asyncpg
 import asyncpg.pool
-
-from aurflux.command import Command, Response
-from aurflux.context import GuildMessageCtx
 import aurflux.auth
 import aurflux.cog
-import typing as ty
-import TOKENS
-import tqdm
 import discord
-import datetime
+import tqdm
+from aurflux.command import Response
+from aurflux.context import GuildMessageCtx
+
+import TOKENS
 
 if ty.TYPE_CHECKING:
-   from aurflux.command import Command
+   pass
 
 import decompose
 import aurflux
@@ -26,12 +24,13 @@ import pickle
 
 class MessageScraper(aurflux.cog.FluxCog):
 
+   def __init__(self, *args, **kwargs):
+      self.pool: ty.Optional[asyncpg.pool.Pool] = None
+      super(MessageScraper, self).__init__(*args, **kwargs)
+
    async def startup(self):
       print(f"Starting up {self}")
       self.pool: asyncpg.pool.Pool = await asyncpg.create_pool(TOKENS.PSQL_STRING, ssl=True)
-
-      def _():
-         pass
 
    async def process_message(self, message: discord.Message):
       message_query, message_args = decompose.build_insert(decompose.message(message), "messages")
@@ -77,12 +76,12 @@ class MessageScraper(aurflux.cog.FluxCog):
          pass
 
    def load(self):
-      @self.flux.router.endpoint(":message", decompose=True)
+      @self.flux.router.listen_for(":message")
       async def message_handler(message: discord.Message):
          await self.process_message(message)
 
       @self._commandeer(name="scrape")
-      async def scrape(ctx: GuildMessageCtx, args):
+      async def scrape(_: GuildMessageCtx, args):
          if channel := self.flux.get_channel(int(args)):
             await self.scrape_channel(channel)
          else:
@@ -91,7 +90,7 @@ class MessageScraper(aurflux.cog.FluxCog):
          return Response("Done!")
 
       @self._commandeer(name="names")
-      async def names(ctx: GuildMessageCtx, _):
+      async def names(_: GuildMessageCtx, _0):
          async with self.pool.acquire() as c:
             async with self.pool.acquire() as c2:
                async with c.transaction():
